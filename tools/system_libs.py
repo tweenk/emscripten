@@ -336,7 +336,9 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
     if shared.Settings.SPLIT_MEMORY:
       cflags += ['-DMSPACES', '-DONLY_MSPACES']
     if shared.Settings.DEBUG_LEVEL >= 3:
-      cflags += ['-UNDEBUG', '-DDLMALLOC_DEBUG', '-DEMMALLOC_DEBUG']
+      cflags += ['-UNDEBUG', '-DDLMALLOC_DEBUG']
+      # TODO: consider doing -DEMMALLOC_DEBUG, but it is very slow, perhaps
+      #       more appropriate for SAFE_HEAP
     else:
       cflags += ['-DNDEBUG']
     check_call([shared.PYTHON, shared.EMCC, shared.path_from_root('system', 'lib', malloc_source()), '-o', o] + cflags)
