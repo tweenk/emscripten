@@ -383,12 +383,15 @@ struct Region {
 
   // Other utilities.
 
-  size_t getPayloadSize() {
+  size_t getMetadataSize() {
     if (isNormal()) {
-      return getTotalSize() - sizeof(NormalMetadata);
+      return NORMAL_METADATA_SIZE;
     } else {
-      return getTotalSize() - sizeof(MiniMetadata);
+      return MINI_METADATA_SIZE;
     }
+  }
+  size_t getPayloadSize() {
+    return getTotalSize() - getMetadatasize();
   }
 
   // A mini region has limits on its size, and a region must also
@@ -403,9 +406,14 @@ struct Region {
     }
     return true;
   }
-
   int canGrowTo(size_t size) {
     return canGrowTo(size, getNext());
+  }
+  int canGrowPayloadTo(size_t size, Region* possibleNext) {
+    return canGrowTo(getMetadataSize() + size, next);
+  }
+  int canGrowPayloadTo(size_t size) {
+    return canGrowPayloadTo(size, getNext());
   }
 };
 
@@ -498,7 +506,7 @@ static void addToFreeList(Region* region) {
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.addToFreeList " + $0) }, region);
 #endif
-  assert(getAfter(region) <= sbrk(0));
+  assert(region->getAfter() <= sbrk(0));
   size_t index = getFreeListIndex(region->getPayloadSize());
   FreeInfo* freeInfo = &region->freeInfo();
   FreeInfo* last = freeLists[index];
@@ -516,7 +524,7 @@ static int mergeIntoExistingFreeRegion(Region* region) {
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion " + $0) }, region);
 #endif
-  assert(getAfter(region) <= sbrk(0));
+  assert(region->getAfter() <= sbrk(0));
   int merged = 0;
   Region* prev = region->prev();
   Region* next = region->next();
@@ -656,9 +664,9 @@ static void possiblySplitRemainder(Region* region, size_t size) {
 #endif
     // Worth it, split the region
     // TODO: Consider not doing it, may affect long-term fragmentation.
-    void* after = getAfter(region);
+    void* after = region->getAfter();
     // Align for a pointer. We will create a normal region here, not a mini.
-    Region* split = (Region*)alignUpPointer((char*)getPayload(region) + size);
+    Region* split = (Region*)alignUpPointer((char*)region->getPayload() + size);
     region->setTotalSize((char*)split - (char*)region);
     size_t totalSplitSize = (char*)after - (char*)split;
     assert(totalSplitSize >= MIN_NORMAL_REGION_SIZE);
@@ -714,14 +722,14 @@ void emmalloc_blank_slate_from_orbit() {
 #ifdef EMMALLOC_DEBUG
 // For testing purposes, validate a region.
 static void emmalloc_validate_region(Region* region) {
-  assert(getAfter(region) <= sbrk(0));
+  assert(region->getAfter() <= sbrk(0));
   assert(region->getPayloadSize() < region->getTotalSize());
   if (region->prev()) {
     assert(getAfter(region->prev()) == region);
     assert(region->prev()->next() == region);
   }
   if (region->next()) {
-    assert(getAfter(region) == region->next());
+    assert(region->getAfter() == region->next());
     assert(region->next()->prev() == region);
   }
 }
@@ -773,7 +781,7 @@ static void emmalloc_validate_all() {
         var region = $0;
         assert(Module.emmallocDebug.regions[region], "free region not in list");
       }, region);
-      assert(getAfter(region) <= end);
+      assert(region->getAfter() <= end);
       assert(!region->getUsed());
       assert(region->getPayloadSize() >= getMinSizeForFreeListIndex(i));
       assert(region->getPayloadSize() <  getMaxSizeForFreeListIndex(i));
@@ -795,7 +803,7 @@ static void emmalloc_validate_all() {
 // For testing purposes, dump out a region.
 static void emmalloc_dump_region(Region* region) {
   EM_ASM({ Module.print("      [" + $0 + " - " + $1 + " (" + $2 + " bytes" + ($3 ? ", used" : "") + ($4 ? ", mini" : "") + ")]") },
-         region, getAfter(region), region->getPayloadSize(), region->getUsed(), region->isMini());
+         region, region->getAfter(), region->getPayloadSize(), region->getUsed(), region->isMini());
 }
 
 // For testing purposes, dumps out the entire global state.
@@ -972,25 +980,24 @@ static Region* newAllocation(size_t size) {
   EM_ASM({ Module.print("  emmalloc.newAllocation " + $0) }, size);
 #endif
   assert(size > 0);
-  if (lastRegion) {
-    // If the last region is free, we can extend it rather than leave it
-    // as fragmented free spce between allocated regions. This is also
-    // more efficient and simple as well.
-    if (!lastRegion->getUsed()) {
+  // If the last region is free, we can extend it rather than leave it
+  // as fragmented free spce between allocated regions. This is also
+  // more efficient and simple as well.
+  if (lastRegion && !lastRegion->getUsed() &&
+      lastRegion->canGrowPayloadTo(size, NULL)) {
 #ifdef EMMALLOC_DEBUG_LOG
-      EM_ASM({ Module.print("    emmalloc.newAllocation extending lastRegion at " + $0) }, lastRegion);
+    EM_ASM({ Module.print("    emmalloc.newAllocation extending lastRegion at " + $0) }, lastRegion);
 #endif
-      // Remove it first, before we adjust the size (which affects which list
-      // it should be in). Also mark it as used so extending it doesn't do
-      // freelist computations; we'll undo that if we fail.
-      lastRegion->setUsed(1);
-      removeFromFreeList(lastRegion);
-      if (extendLastRegionPayload(size)) {
-        return lastRegion;
-      } else {
-        lastRegion->setUsed(0);
-        return NULL;
-      }
+    // Remove it first, before we adjust the size (which affects which list
+    // it should be in). Also mark it as used so extending it doesn't do
+    // freelist computations; we'll undo that if we fail.
+    lastRegion->setUsed(1);
+    removeFromFreeList(lastRegion);
+    if (extendLastRegionPayload(size)) {
+      return lastRegion;
+    } else {
+      lastRegion->setUsed(0);
+      return NULL;
     }
   }
   // Otherwise, get a new region.
@@ -1012,13 +1019,13 @@ static void* emmalloc_malloc(size_t size) {
       return NULL;
     }
   }
-  assert(getAfter(region) <= sbrk(0));
-  return getPayload(region);
+  assert(region->getAfter() <= sbrk(0));
+  return region->getPayload();
 }
 
 static void emmalloc_free(void *ptr) {
   if (ptr == NULL) return;
-  stopUsing(fromPayload(ptr));
+  stopUsing(Region::fromPayload(ptr));
 }
 
 static void* emmalloc_calloc(size_t nmemb, size_t size) {
@@ -1036,7 +1043,7 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     emmalloc_free(ptr);
     return NULL;
   }
-  Region* region = fromPayload(ptr);
+  Region* region = Region::fromPayload(ptr);
   // Grow it. First, maybe we can do simple growth in the current region.
   if (size <= region->getPayloadSize()) {
 #ifdef EMMALLOC_DEBUG_LOG
@@ -1049,7 +1056,9 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
   }
   // Perhaps right after us is free space we can merge to us.
   Region* next = region->next();
-  if (next && !next->getUsed()) {
+  if (next && !next->getUsed() &&
+      region->canGrowTo(region->getTotalSize() + next->getTotalSize(),
+                        next->getNext())) {
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("  emmalloc.emmalloc_realloc merge in next") });
 #endif
@@ -1060,16 +1069,16 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     } else {
       lastRegion = region;
     }
-  }
-  // We may now be big enough.
-  if (size <= region->getPayloadSize()) {
-#ifdef EMMALLOC_DEBUG_LOG
-    EM_ASM({ Module.print("  emmalloc.emmalloc_realloc use existing payload space after merge") });
-#endif
-    region->setUsed(1);
-    // There might be enough left over to split out now.
-    possiblySplitRemainder(region, size);
-    return ptr;
+    // We may now be big enough.
+    if (size <= region->getPayloadSize()) {
+  #ifdef EMMALLOC_DEBUG_LOG
+      EM_ASM({ Module.print("  emmalloc.emmalloc_realloc use existing payload space after merge") });
+  #endif
+      region->setUsed(1);
+      // There might be enough left over to split out now.
+      possiblySplitRemainder(region, size);
+      return ptr;
+    }
   }
   // We still aren't big enough. If we are the last, we can extend ourselves - however, that
   // definitely means increasing the total sbrk(), and there may be free space lower down, so
@@ -1097,7 +1106,7 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     newRegion = newAllocation(size);
     if (!newRegion) return NULL;
   }
-  memcpy(getPayload(newRegion), getPayload(region), size < region->getPayloadSize() ? size : region->getPayloadSize());
+  memcpy(getPayload(newRegion), region->getPayload(), size < region->getPayloadSize() ? size : region->getPayloadSize());
   stopUsing(region);
   return getPayload(newRegion);
 }
@@ -1129,7 +1138,7 @@ static struct mallinfo emmalloc_mallinfo() {
   }
   return info;
 }
-
+waka
 // An aligned allocation. This is a rarer allocation path, and is
 // much less optimized - the assumption is that it is used for few
 // large allocations.
@@ -1146,7 +1155,7 @@ static void* alignedAllocation(size_t size, size_t alignment) {
   Region* fromFreeList = tryFromFreeList(size + alignment);
   if (fromFreeList && size_t(getPayload(fromFreeList)) % alignment == 0) {
     // Luck has favored us.
-    return getPayload(fromFreeList);
+    return fromFreeList->getPayload();
   } else if (fromFreeList) {
     stopUsing(fromFreeList);
   }
@@ -1180,7 +1189,7 @@ static void* alignedAllocation(size_t size, size_t alignment) {
   }
   Region* region = allocateRegion(size);
   if (!region) return NULL;
-  void* ptr = getPayload(region);
+  void* ptr = region->getPayload();
   assert(size_t(ptr) == address);
   assert(size_t(ptr) % alignment == 0);
   return ptr;
