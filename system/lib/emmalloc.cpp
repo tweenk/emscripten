@@ -169,74 +169,91 @@ static Region* firstRegion = NULL;
 // The last region of memory.
 static Region* lastRegion = NULL;
 
-// A contiguous region of memory. Metadata at the beginning describes it,
-// after which is the "payload", the sections that user code calling
-// malloc can use.
+struct NormalMetadata {
+  // This will be false. Note how this is in harmony with mini metadata
+  // and the second word of data here, the prev pointer, and as a result
+  // the very first bit is how we can test if something is mini
+  // or not, and that works on either the single word of a mini,
+  // or either of the words of the normal (we may arrive at the first
+  // if arriving from the previous, or the second if looking 4 back from
+  // the payload).
+  size_t _isMini : 1;
+
+  // Whether this region is in use or not.
+  size_t _used : 1;
+
+  // The total size of the section of memory this is associated
+  // with and contained in.
+  // That includes the metadata itself and the payload memory after,
+  // which includes the used and unused portions of it.
+  // This should be shifted by 2 to get the actual value (note that
+  // the allocation is a multiple of 4 anyhow).
+  size_t _totalSize : NORMAL_SIZE_BITS;
+
+  // Each memory area knows its previous neighbor, as we hope to merge them.
+  // To compute the next neighbor we can use the total size, and to know
+  // if a neighbor exists we can compare the region to lastRegion.
+  // In a normal region, a full pointer is kept to the previous region.
+  // Importantly, since all our regions are on addresses that are multiples
+  // of 4, the lowest bit is always clear. That is in harmony with how we
+  // check for a normal region in the second 4 bytes as well, so it is
+  // ok to check if a region is mini or normal in that way on either of
+  // them.
+  Region* _prev;
+};
+
+struct Mini {
+  // This will be true.
+  size_t _isMini : 1;
+
+  // Whether this region is in use or not.
+  size_t _used : 1;
+
+  // As with normal metadata, this value should be shifted by 2, so the
+  // range is up to 128K.
+  size_t _totalSize : MINI_SIZE_BITS;
+
+  // We store the offset here to the previous region; we don't have room
+  // to store a normal pointer. This value should be shifted by 2, as
+  // region sizes are a multiple of that size, so the range here is up
+  // to 128K.
+  // This offset is from the actual start of the mini metadata, which is
+  // here - after _prevData.
+  size_t _prev : MINI_PREV_BITS;
+} mini;
+
+// A contiguous region of memory.
 struct Region {
   // A region has either normal or mini metadata.
   union {
-    struct Normal {
-      // Each memory area knows its previous neighbor, as we hope to merge them.
-      // To compute the next neighbor we can use the total size, and to know
-      // if a neighbor exists we can compare the region to lastRegion
-      Region* _prev;
-
-      // The total size of the section of memory this is associated
-      // with and contained in.
-      // That includes the metadata itself and the payload memory after,
-      // which includes the used and unused portions of it.
-      // This should be shifted by 2 to get the actual value (note that
-      // the allocation is a multiple of 4 anyhow).
-      size_t _totalSize : NORMAL_SIZE_BITS;
-
-      // Whether this region is in use or not.
-      size_t _used : 1;
-
-      // This will be false.
-      size_t _isMini : 1;
-    } normal;
-
-    struct Mini {
-      // The mini metadata doesn't extend this far back - here we would find
-      // payload data from the previous region. Don't touch it!
-      size_t _prevData;
-
-      // We store the offset here to the previous region; we don't have room
-      // to store a normal pointer. This value should be shifted by 2, as
-      // region sizes are a multiple of that size, so the range here is up
-      // to 128K.
-      // This offset is from the actual start of the mini metadata, which is
-      // here - after _prevData.
-      size_t _prev : MINI_PREV_BITS;
-
-      // As with normal metadata, this value should be shifted by 2, so the
-      // range is up to 128K.
-      size_t _totalSize : MINI_SIZE_BITS;
-
-      // Whether this region is in use or not.
-      size_t _used : 1;
-
-      // This will be true.
-      size_t _isMini : 1;
-    } mini;
+    NormalMetadata normal;
+    MiniMetadata mini;
   };
 
-  // Up to here was the fixed metadata, of size 16. The rest is either
-  // the payload, or freelist info.
-  union {
-    FreeInfo _freeInfo;
-    char _payload[];
-  };
+  // After the metadata is the payload, if in use, or freelist info
+  // if not.
 
   // Getters/setters.
 
   int isNormal() {
-    // The mini bit is the same place in both versions.
+    // The mini bit is the same place in both versions, and also identical
+    // in the two words of a normal metadata.
     return !normal._isMini;
   }
   int isMini() {
     // The mini bit is the same place in both versions.
+    assert(normal._isMini == mini._isMini);
     return normal._isMini;
+  }
+  size_t getUsed() {
+    // The used bit is the same place in both versions.
+    assert(normal._isUsed == mini._isUsed);
+    return normal._isUsed;
+  }
+  void setUsed(size_t x) {
+    // The used bit is the same place in both versions.
+    normal._isUsed = x;
+    assert(normal._isUsed == mini._isUsed);
   }
   size_t getTotalSize() {
     if (isNormal()) {
@@ -268,20 +285,6 @@ struct Region {
       mini._totalSize -= x >> MINI_SIZE_SHIFTS;
     }
   }
-  size_t getUsed() {
-    if (isNormal()) {
-      return normal._used;
-    } else {
-      return mini._used;
-    }
-  }
-  void setUsed(size_t x) {
-    if (isNormal()) {
-      normal._used = x;
-    } else {
-      mini._used = x;
-    }
-  }
   Region* getPrev() {
     if (isNormal()) {
       return normal._prev;
@@ -303,43 +306,56 @@ struct Region {
 
   // Utilities.
 
-  // The next region is computed it on the fly
   Region* getNext() {
-// XXX does lastRegion hold the real of 4/off location of the mini?
+    // The next region is computed on the fly.
     if (this != lastRegion) {
       return (Region*)((char*)this + getTotalSize());
     } else {
       return NULL;
     }
   }
-  FreeInfo& freeInfo() { return _freeInfo; }
-  // The payload is special, we just return its address, as we
-  // never want to modify it ourselves.
-  char* payload() { return &_payload[0]; }
+  void* getPayload() {
+    if (isNormal()) {
+      return (void*)((char*)this + sizeof(NormalMetadata));
+    } else {
+      return (void*)((char*)this + sizeof(MiniMetadata));
+    }
+  }
+  FreeInfo* getFreeInfo() {
+    assert(!getUsed());
+    return (FreeInfo*)getPayload();
+  }
+
+  // Static region getters.
+
+  static Region* getFromPayload(void* payload) {
+    // Look 4 behind for what is either a mini metadata or
+    // the last 4 bytes of a normal one. In both cases,
+    // the same bit tells us what it is.
+    Region* region = (char*)payload - 4;
+    if (region->isNormal()) {
+      // We had the last 4 bytes, look 4 behind to get the
+      // actual region.
+      region = (char*)region - 4;
+      assert(region->isNormal());
+    }
+    return region;
+  }
+  static Region* getFromFreeInfo(FreeInfo* freeInfo) {
+    // The freelist info is in the same place as the payload.
+    return getFromPayload((void*)freeInfo);
+  }
+
+  // Other utilities.
+
+  size_t getPayloadSize() {
+    if (isNormal()) {
+      return getTotalSize() - sizeof(NormalMetadata);
+    } else {
+      return getTotalSize() - sizeof(MiniMetadata);
+    }
+  }
 };
-
-// Region utilities
-
-static void* getPayload(Region* region) {
-  assert(((char*)&region->freeInfo()) - ((char*)region) == METADATA_SIZE);
-  assert(region->getUsed());
-  assert(sizeof(FreeInfo) == ALLOC_UNIT);
-  assert(ALLOC_UNIT == ALIGNMENT);
-  assert(METADATA_SIZE == ALIGNMENT);
-  return region->payload();
-}
-
-static Region* fromPayload(void* payload) {
-  return (Region*)((char*)payload - METADATA_SIZE);
-}
-
-static Region* fromFreeInfo(FreeInfo* freeInfo) {
-  return (Region*)((char*)freeInfo - METADATA_SIZE);
-}
-
-static size_t getMaxPayload(Region* region) {
-  return region->getTotalSize() - METADATA_SIZE;
-}
 
 // Globals
 
@@ -354,6 +370,8 @@ static size_t getMaxPayload(Region* region) {
 //
 // Note that there is no freelist for 2^32, as that amount can
 // never be allocated.
+
+XXX do we need separate freelists for align 4 and 8?
 
 static const size_t MIN_FREELIST_INDEX = 3;  // 8 == ALLOC_UNIT
 static const size_t MAX_FREELIST_INDEX = 32; // uint32_t
