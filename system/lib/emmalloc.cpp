@@ -117,6 +117,17 @@ static const size_t NORMAL_METADATA_SIZE = 8;
 // How big a minimal normal region is.
 static const size_t MIN_NORMAL_REGION_SIZE = NORMAL_METADATA_SIZE + ALLOC_UNIT;
 
+// How many bits are used to store the size, and how to shift it.
+static const size_t NORMAL_SIZE_BITS = 30;
+static const size_t NORMAL_SIZE_SHIFTS = 2;
+
+static const size_t MINI_SIZE_BITS = 15;
+static const size_t MINI_SIZE_SHIFTS = 2;
+
+// How many bits are used to store the offset to the previous region, and how to shift it.
+static const size_t MINI_PREV_BITS = 15;
+static const size_t MINI_PREV_SHIFTS = 2;
+
 // General utilities
 
 // Align a pointer, increasing it upwards as necessary
@@ -176,7 +187,7 @@ struct Region {
       // which includes the used and unused portions of it.
       // This should be shifted by 2 to get the actual value (note that
       // the allocation is a multiple of 4 anyhow).
-      size_t _totalSize : 30;
+      size_t _totalSize : NORMAL_SIZE_BITS;
 
       // Whether this region is in use or not.
       size_t _used : 1;
@@ -194,18 +205,20 @@ struct Region {
       // to store a normal pointer. This value should be shifted by 2, as
       // region sizes are a multiple of that size, so the range here is up
       // to 128K.
-      size_t _prev : 15;
+      // This offset is from the actual start of the mini metadata, which is
+      // here - after _prevData.
+      size_t _prev : MINI_PREV_BITS;
 
       // As with normal metadata, this value should be shifted by 2, so the
       // range is up to 128K.
-      size_t _totalSize : 15;
+      size_t _totalSize : MINI_SIZE_BITS;
 
       // Whether this region is in use or not.
       size_t _used : 1;
 
       // This will be true.
       size_t _isMini : 1;
-    } normal;
+    } mini;
   };
 
   // Up to here was the fixed metadata, of size 16. The rest is either
@@ -215,17 +228,84 @@ struct Region {
     char _payload[];
   };
 
-  size_t getTotalSize() { return _totalSize; }
-  void setTotalSize(size_t x) { _totalSize = x; }
-  void incTotalSize(size_t x) { _totalSize += x; }
-  void decTotalSize(size_t x) { _totalSize -= x; }
+  // Getters/setters.
 
-  size_t getUsed() { return _used; }
-  void setUsed(size_t x) { _used = x; }
+  int isNormal() {
+    // The mini bit is the same place in both versions.
+    return !normal._isMini;
+  }
+  int isMini() {
+    // The mini bit is the same place in both versions.
+    return normal._isMini;
+  }
+  size_t getTotalSize() {
+    if (isNormal()) {
+      return normal._totalSize << NORMAL_SIZE_SHIFTS;
+    } else {
+      return mini._totalSize << MINI_SIZE_SHIFTS;
+    }
+  }
+  void setTotalSize(size_t x) {
+    if (isNormal()) {
+      normal._totalSize = x >> 2;
+    } else {
+      assert(x < (1 << (MINI_SIZE_BITS + MINI_SIZE_SHIFTS)));
+      mini._totalSize = x >> MINI_SIZE_SHIFTS;
+    }
+  }
+  void incTotalSize(size_t x) {
+    if (isNormal()) {
+      normal._totalSize += x >> NORMAL_SIZE_SHIFTS;
+    } else {
+      assert(getTotalSize() + x < (1 << (MINI_SIZE_BITS + MINI_SIZE_SHIFTS)));
+      mini._totalSize += x >> MINI_SIZE_SHIFTS;
+    }
+  }
+  void decTotalSize(size_t x) {
+    if (isNormal()) {
+      normal._totalSize -= x >> NORMAL_SIZE_SHIFTS;
+    } else {
+      mini._totalSize -= x >> MINI_SIZE_SHIFTS;
+    }
+  }
+  size_t getUsed() {
+    if (isNormal()) {
+      return normal._used;
+    } else {
+      return mini._used;
+    }
+  }
+  void setUsed(size_t x) {
+    if (isNormal()) {
+      normal._used = x;
+    } else {
+      mini._used = x;
+    }
+  }
+  Region* getPrev() {
+    if (isNormal()) {
+      return normal._prev;
+    } else {
+      // Calculate the offset from the actual metadata start.
+      return (void*)(size_t(this) + 4 - (mini._prev << MINI_PREV_SHIFTS));
+    }
+  }
+  void setPrev(void* x) {
+    if (isNormal()) {
+      normal._prev = x;
+    } else {
+      // Calculate the offset from the actual metadata start.
+      size_t offset = size_t(this) + 4 - size_t(x);
+      assert(offset < (1 << (MINI_PREV_BITS + MINI_PREV_SHIFTS)));
+      mini._prev = x >> MINI_PREV_SHIFTS;
+    }
+  }
 
-  Region*& prev() { return _prev; }
-  // The next region is not, as we compute it on the fly
-  Region* next() {
+  // Utilities.
+
+  // The next region is computed it on the fly
+  Region* getNext() {
+// XXX does lastRegion hold the real of 4/off location of the mini?
     if (this != lastRegion) {
       return (Region*)((char*)this + getTotalSize());
     } else {
@@ -259,11 +339,6 @@ static Region* fromFreeInfo(FreeInfo* freeInfo) {
 
 static size_t getMaxPayload(Region* region) {
   return region->getTotalSize() - METADATA_SIZE;
-}
-
-// TODO: move into class, make more similar to next()
-static void* getAfter(Region* region) {
-  return ((char*)region) + region->getTotalSize();
 }
 
 // Globals
