@@ -598,9 +598,9 @@ static void growRegion(Region* region, size_t sizeDelta) {
 
 // Extends the last region to a certain payload size. Returns 1 if successful,
 // 0 if an error occurred in sbrk().
-static int extendLastRegion(size_t size) {
+static int extendLastRegionPayload(size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
-  EM_ASM({ Module.print("  emmalloc.extendLastRegionToSize " + $0) }, size);
+  EM_ASM({ Module.print("  emmalloc.extendLastRegionPayload " + $0) }, size);
 #endif
   size_t reusable = lastRegion->getPayloadSize();
   size_t sbrkSize = getAllocSize(size) - reusable;
@@ -608,7 +608,7 @@ static int extendLastRegion(size_t size) {
   if (ptr == (void*)-1) {
     // sbrk() failed, we failed.
 #ifdef EMMALLOC_DEBUG_LOG
-   EM_ASM({ Module.print("  emmalloc.extendLastRegion sbrk failure") });
+   EM_ASM({ Module.print("  emmalloc.extendLastRegionPayload sbrk failure") });
 #endif
     return 0;
   }
@@ -617,6 +617,10 @@ static int extendLastRegion(size_t size) {
   // Increment the region's size.
   growRegion(lastRegion, sbrkSize);
   return 1;
+}
+
+static int incLastRegion(size_t extra) {
+  return extendLastRegionPayload(getMaxPayload(lastRegion) + extra);
 }
 
 static void possiblySplitRemainder(Region* region, size_t size) {
@@ -638,7 +642,7 @@ static void possiblySplitRemainder(Region* region, size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("    emmalloc.possiblySplitRemainder pre-extending") });
 #endif
-    if (extendLastRegion(payloadSize + MIN_ALLOC)) {
+    if (incLastRegion(MIN_ALLOC)) {
       // Success.
       extra += MIN_ALLOC;
       assert(extra >= MIN_NORMAL_REGION_SIZE);
@@ -905,51 +909,46 @@ static Region* allocateRegion(size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.allocateRegion") });
 #endif
-  // See if we should use a mini region here. That depends on the current
-  // alignment of the next region, and if the size is appropriate. Note
-  // that we don't need to worry about a next region's prev.
-  // For simplicity, the very first region is not mini (this doesn't
-  // matter much in the big picture anyhow).
-  int useMini = lastRegion && size <= MAX_MINI_SIZE &&
-                Region::hasMiniAlignment(lastRegion->getAfter());
-waka
-  size_t sbrkSize = METADATA_SIZE + alignUp(size);
-  void* ptr = sbrk(sbrkSize);
-  if (ptr == (void*)-1) {
-    // sbrk() failed, we failed.
-#ifdef EMMALLOC_DEBUG_LOG
-    EM_ASM({ Module.print("    emmalloc.allocateRegion sbrk failure") });
-#endif
-    return NULL;
-  }
-  // sbrk() results might not be aligned. We assume single-threaded sbrk()
-  // access here in order to fix that up
-  void* fixedPtr = alignUpPointer(ptr);
-  if (ptr != fixedPtr) {
-#ifdef EMMALLOC_DEBUG_LOG
-    EM_ASM({ Module.print("    emmalloc.allocateRegion fixing alignment") });
-#endif
-    size_t extra = (char*)fixedPtr - (char*)ptr;
-    void* extraPtr = sbrk(extra);
-    if (extraPtr == (void*)-1) {
-      // sbrk() failed, we failed.
-#ifdef EMMALLOC_DEBUG_LOG
-      EM_ASM({ Module.print("    emmalloc.newAllocation sbrk failure") });;
-#endif
+  if (!lastRegion) {
+    // If this is the very first region, ensure the sbrk alignment is valid.
+    void* ptr = sbrk(0);
+    if (ptr == (void*)-1) return NULL;
+    void* fixedPtr = alignUpPointer(ptr);
+    if (ptr != fixedPtr) {
+      size_t extra = (char*)fixedPtr - (char*)ptr;
+      void* extraPtr = sbrk(extra);
+      if (extraPtr == (void*)-1) {
+        // sbrk() failed, we failed.
+        return NULL;
+      }
+    }
+  } else if ((lastRegion->getTotalSize() > MAX_MINI_SIZE ||
+              size + MINI_METADATA_SIZE > MAX_MINI_SIZE) &&
+             Region::hasMiniAlignment(lastRegion->getAfter()) {
+    // We need a normal region, but the alignment is for a mini.
+    // The simplest thing is to increase the previous region by
+    // enough to get us the proper alignment for a normal
+    // region. (Both conditions are rare since this only happens
+    // on very large regions, so this is likely not much waste.)
+    if (!incLastRegion(MINI_REGION_ALIGN)) {
       return NULL;
     }
-    // Verify the sbrk() assumption, no one else should call it.
-    // If this fails, it means we also leak the previous allocation,
-    // so we don't even try to handle it.
-    assert((char*)extraPtr == (char*)ptr + sbrkSize);
-    // After the first allocation, everything must remain aligned forever.
-    assert(!lastRegion);
-    // We now have a contiguous block of memory from ptr to
-    // ptr + sbrkSize + fixedPtr - ptr = fixedPtr + sbrkSize.
-    // fixedPtr is aligned and starts a region of the right
-    // amount of memory.
   }
-  Region* region = (Region*)fixedPtr;
+  // We should now have the proper alignment for everything, and are
+  // ready to create the new region.
+  assert(Region::hasMiniAlignment(lastRegion->getAfter()) ||
+         Region::hasNormalAlignment(lastRegion->getAfter()));
+  int useMini = Region::hasMiniAlignment(lastRegion->getAfter());
+  size_t sbrkSize = useMini ? MINI_METADATA_SIZE : NORMAL_METADATA_SIZE;
+  sbrkSize += getAllocSize(size);
+  void* ptr = sbrk(sbrkSize);
+  if (ptr == (void*)-1) return NULL;
+  Region* region = (Region*)ptr;
+  if (useMini) {
+    region->initMini();
+  } else {
+    region->initNormal();
+  }
   // Apply globally
   if (!lastRegion) {
     assert(!firstRegion);
@@ -962,7 +961,7 @@ waka
   }
   // Success, we have new memory
   region->setTotalSize(sbrkSize);
-  useRegion(region, size);
+  region->setUsed(1);
   return region;
 }
 
@@ -986,7 +985,7 @@ static Region* newAllocation(size_t size) {
       // freelist computations; we'll undo that if we fail.
       lastRegion->setUsed(1);
       removeFromFreeList(lastRegion);
-      if (extendLastRegion(size)) {
+      if (extendLastRegionPayload(size)) {
         return lastRegion;
       } else {
         lastRegion->setUsed(0);
@@ -1081,7 +1080,7 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("  emmalloc.emmalloc_realloc extend last region") });
 #endif
-    if (extendLastRegion(size)) {
+    if (extendLastRegionPayload(size)) {
       // It worked. We don't need the formerly free region.
       if (newRegion) {
         stopUsing(newRegion);
@@ -1172,7 +1171,7 @@ static void* alignedAllocation(size_t size, size_t alignment) {
     // need to add 8.
     size_t extra = alignment - error;
     assert(extra % ALIGNMENT == 0);
-    if (!extendLastRegion(getMaxPayload(lastRegion) + extra)) {
+    if (!incLastRegion(extra)) {
       return NULL;
     }
     address = size_t(getAfter(lastRegion)) + METADATA_SIZE;
