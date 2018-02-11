@@ -9,19 +9,41 @@
  *  - sbrk() will not be accessed by anyone else.
  *  - sbrk() is very fast in most cases (internal wasm call).
  *
- * Invariants:
+ * Invariants and design:
  *
- *  - Metadata is 8 bytes, allocation payload is a
- *    multiple of 8 bytes.
+ *  - Default alignment for memory is 8 bytes.
+ *  - Payload allocation is done in units of 4 bytes.
+ *  - The minimal payload is 8 bytes. This allows embedding the freelist
+ *    pointers when a region is not in use. While this does mean that
+ *    4-byte allocations are less efficient, in practice such allocations
+ *    are quite rare.
+ *  - Metadata is 4 or 8 bytes. The "mini" 4 byte version is used
+ *    when the region and its predecessor are small enough (so that
+ *    we can fit all the info in 32 bits), and when doing so would
+ *    help us avoid wasting space due to alignment. For example,
+ *    if we are at an aligned address - a multiple of 8 - then
+ *    we may as well use the regular 8 byte metadata, as then the
+ *    payload will be aligned. But if we not 8 byte aligned, and only
+ *    4, then we'll try to use a mini metadata.
+ *     - If the region or the previous one are quite large, then
+ *       wasting 4 bytes or so doesn't matter anyhow. But for many
+ *       small allocations this is significant.
+ *     - The one tricky thing here is that we also need the previous
+ *       region to be small enough. If it grows, we need to make sure
+ *       it doesn't grow too much, which can be a source of
+ *       fragmentation, but as it is limited by the number of quite
+ *       large regions, it tends to be minimal.
  *  - All regions of memory are adjacent.
- *  - Due to the above, after initial alignment fixing, all
- *    regions are aligned.
  *  - A region is either in use (used payload > 0) or not.
  *    Used regions may be adjacent, and a used and unused region
  *    may be adjacent, but not two unused ones - they would be
- *    merged.
+ *    merged, *except* for the case where we can't merge free space
+ *    due to the later region having a mini header.
  *  - A used region always has minimal space at the end - we
- *    split off extra space when possible immediately.
+ *    split off extra space when possible immediately. This lets us
+ *    just use 1 bit to indicate if the region is used or not. This
+ *    does mean we may memcpy() more than needed by a little when
+ *    doing a realloc, though.
  *
  * Debugging:
  *
@@ -82,26 +104,33 @@ static size_t lowerBoundPowerOf2(size_t x) {
 // All allocations are aligned to this value.
 static const size_t ALIGNMENT = 8;
 
-// Even allocating 1 byte incurs this much actual payload
-// allocation. This is our minimum bin size.
-static const size_t ALLOC_UNIT = ALIGNMENT;
+// Allocation of payloads is at least of this size.
+static const size_t MIN_ALLOC = 8;
 
-// How big the metadata is in each region. It is convenient
-// that this is identical to the above values.
-static const size_t METADATA_SIZE = ALLOC_UNIT;
+// Allocation is done in multiples of this amount.
+static const size_t ALLOC_UNIT = 4;
 
-// How big a minimal region is.
-static const size_t MIN_REGION_SIZE = METADATA_SIZE + ALLOC_UNIT;
+// How big the metadata is in each region.
+static const size_t MINI_METADATA_SIZE = 4;
+static const size_t NORMAL_METADATA_SIZE = 8;
 
-// Constant utilities
+// How big a minimal normal region is.
+static const size_t MIN_NORMAL_REGION_SIZE = NORMAL_METADATA_SIZE + ALLOC_UNIT;
+
+// General utilities
 
 // Align a pointer, increasing it upwards as necessary
-static size_t alignUp(size_t ptr) {
+static size_t alignUpPointer(size_t ptr) {
   return (size_t(ptr) + ALIGNMENT - 1) & -ALIGNMENT;
 }
 
 static void* alignUpPointer(void* ptr) {
-  return (void*)alignUp(size_t(ptr));
+  return (void*)alignUpPointer(size_t(ptr));
+}
+
+static void getAllocSize(size_t size) {
+  if (size < MIN_ALLOC) return MIN_ALLOC;
+  return (size + ALLOC_UNIT - 1) & -ALLOC_UNIT;
 }
 
 //
@@ -126,31 +155,58 @@ struct FreeInfo {
 // The first region of memory.
 static Region* firstRegion = NULL;
 
-// The last region of memory. It's important to know the end
-// since we may append to it.
+// The last region of memory.
 static Region* lastRegion = NULL;
 
 // A contiguous region of memory. Metadata at the beginning describes it,
 // after which is the "payload", the sections that user code calling
 // malloc can use.
 struct Region {
-  // The total size of the section of memory this is associated
-  // with and contained in.
-  // That includes the metadata itself and the payload memory after,
-  // which includes the used and unused portions of it.
-  // FIXME: Shift by 1, as our size is even anyhow?
-  //        Or, disallow allocation of half the total space or above.
-  //        Browsers barely allow allocating 2^31 anyhow, so inside that
-  //        space we can just allocate something smaller than it.
-  size_t _totalSize : 31;
+  // A region has either normal or mini metadata.
+  union {
+    struct Normal {
+      // Each memory area knows its previous neighbor, as we hope to merge them.
+      // To compute the next neighbor we can use the total size, and to know
+      // if a neighbor exists we can compare the region to lastRegion
+      Region* _prev;
 
-  // Whether this region is in use or not.
-  size_t _used : 1;
+      // The total size of the section of memory this is associated
+      // with and contained in.
+      // That includes the metadata itself and the payload memory after,
+      // which includes the used and unused portions of it.
+      // This should be shifted by 2 to get the actual value (note that
+      // the allocation is a multiple of 4 anyhow).
+      size_t _totalSize : 30;
 
-  // Each memory area knows its previous neighbor, as we hope to merge them.
-  // To compute the next neighbor we can use the total size, and to know
-  // if a neighbor exists we can compare the region to lastRegion
-  Region* _prev;
+      // Whether this region is in use or not.
+      size_t _used : 1;
+
+      // This will be false.
+      size_t _isMini : 1;
+    } normal;
+
+    struct Mini {
+      // The mini metadata doesn't extend this far back - here we would find
+      // payload data from the previous region. Don't touch it!
+      size_t _prevData;
+
+      // We store the offset here to the previous region; we don't have room
+      // to store a normal pointer. This value should be shifted by 2, as
+      // region sizes are a multiple of that size, so the range here is up
+      // to 128K.
+      size_t _prev : 15;
+
+      // As with normal metadata, this value should be shifted by 2, so the
+      // range is up to 128K.
+      size_t _totalSize : 15;
+
+      // Whether this region is in use or not.
+      size_t _used : 1;
+
+      // This will be true.
+      size_t _isMini : 1;
+    } normal;
+  };
 
   // Up to here was the fixed metadata, of size 16. The rest is either
   // the payload, or freelist info.
