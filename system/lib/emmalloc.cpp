@@ -113,7 +113,7 @@ static const size_t MINI_METADATA_SIZE = 4;
 static const size_t NORMAL_METADATA_SIZE = 8;
 
 // How big a minimal normal region is.
-static const size_t MIN_NORMAL_REGION_SIZE = NORMAL_METADATA_SIZE + ALLOC_UNIT;
+static const size_t MIN_NORMAL_REGION_SIZE = NORMAL_METADATA_SIZE + MIN_ALLOC;
 
 // How many bits are used to store the size, and how to shift it.
 static const size_t NORMAL_SIZE_BITS = 30;
@@ -634,13 +634,23 @@ static int incLastRegion(size_t extra) {
   return extendLastRegionPayload(lastRegion->getPayloadSize() + extra);
 }
 
+// Possibly split the unused portion of a region into another region.
+// For now, we just create a normal region from the remainder.
+// TODO: Investigate a mini as well.
 static void possiblySplitRemainder(Region* region, size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.possiblySplitRemainder " + [$0, $1]) }, region, size);
 #endif
+  size = getAllocationSize(size);
   size_t payloadSize = region->getPayloadSize();
   assert(payloadSize >= size);
   size_t extra = payloadSize - size;
+  if (extra < MIN_NORMAL_REGION_SIZE) return;
+  void* splitStart = (char*)region->getPayload() + size;
+  // Since we target a normal region, we need to ensure the proper alignment.
+  if (!Region::hasNormalAlignment((void*)splitStart)) {
+    extra -= MINI_REGION_ALIGN;
+  }
   // Room for a minimal region is definitely worth splitting. Otherwise,
   // if we don't have room for a full region, but we do have an allocation
   // unit's worth, and we are the last region, it's worth allocating some
@@ -665,11 +675,14 @@ static void possiblySplitRemainder(Region* region, size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("    emmalloc.possiblySplitRemainder is splitting") });
 #endif
+emmalloc_dump_all();
     // Worth it, split the region
     // TODO: Consider not doing it, may affect long-term fragmentation.
     void* after = region->getAfter();
     // Align for a pointer. We will create a normal region here, not a mini.
-    Region* split = (Region*)alignUpPointer((char*)region->getPayload() + size);
+    Region* split = (Region*)((char*)region->getAfter() - extra);
+    assert(Region::hasNormalAlignment(split));
+    region->initNormal();
     region->setTotalSize((char*)split - (char*)region);
     size_t totalSplitSize = (char*)after - (char*)split;
     assert(totalSplitSize >= MIN_NORMAL_REGION_SIZE);
@@ -681,6 +694,7 @@ static void possiblySplitRemainder(Region* region, size_t size) {
       lastRegion = split;
     }
     stopUsing(split);
+emmalloc_dump_all();
   }
 }
 
