@@ -269,8 +269,7 @@ struct Region {
     // in the two words of a normal metadata.
     assert(normal._isMini == mini._isMini);
     assert(normal._isMini == hasMiniAlignment(this));
-    // It's usually faster to check the alignment than to do a load of the bit.
-    // TODO: verify
+    //return !normal._isMini; // TODO: larger but perhaps faster
     return hasNormalAlignment(this);
   }
   int isMini() {
@@ -399,11 +398,8 @@ struct Region {
   // Other utilities.
 
   size_t getMetadataSize() {
-    if (isNormal()) {
-      return NORMAL_METADATA_SIZE;
-    } else {
-      return MINI_METADATA_SIZE;
-    }
+    // 4 for mini, double for normal.
+    return 4 << isNormal();
   }
   size_t getPayloadSize() {
     return getTotalSize() - getMetadataSize();
