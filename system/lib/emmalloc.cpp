@@ -728,6 +728,9 @@ static Region* useFreeInfo(FreeInfo* freeInfo, size_t size) {
 // Mostly for testing purposes, wipes everything.
 EMMALLOC_EXPORT
 void emmalloc_blank_slate_from_orbit() {
+#ifdef EMMALLOC_DEBUG_LOG
+  EM_ASM({ Module.print("  emmalloc.emmalloc_blank_slate_from_orbit") });
+#endif
   for (int i = 0; i < MAX_FREELIST_INDEX; i++) {
     freeLists[i] = NULL;
   }
@@ -970,10 +973,10 @@ static Region* allocateRegion(size_t size) {
          Region::hasNormalAlignment(sbrk(0)));
   int useMini = lastRegion && Region::hasMiniAlignment(lastRegion->getAfter());
   size_t sbrkSize = useMini ? MINI_METADATA_SIZE : NORMAL_METADATA_SIZE;
+  sbrkSize += getAllocationSize(size);
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.allocateRegion allocating " + [$0, $1]) }, useMini, sbrkSize);
 #endif
-  sbrkSize += getAllocationSize(size);
   void* ptr = sbrk(sbrkSize);
   if (ptr == (void*)-1) return NULL;
   Region* region = (Region*)ptr;
@@ -1199,13 +1202,13 @@ static void* alignedAllocation(size_t size, size_t alignment) {
   // See if we need to enlarge the previous region in order to get
   // us properly aligned. Take into account that our region will
   // start with METADATA_SIZE of space.
+//EM_ASM({ Module.print("    emmalloc.debug " + [$0]) }, waka);
   size_t address = size_t(lastRegion->getAfter()) + NORMAL_METADATA_SIZE;
   size_t error = address % alignment;
   if (error != 0) {
     // E.g. if we want alignment 24, and have address 16, then we
     // need to add 8.
     size_t extra = alignment - error;
-    assert(extra % ALIGNMENT == 0);
     if (!incLastRegion(extra)) {
       return NULL;
     }
