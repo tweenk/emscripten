@@ -244,9 +244,11 @@ struct Region {
   // if not.
 
   void initNormal() {
+    assert(hasNormalAlignment(this));
     normal._isMini = 0;
   }
   void initMini() {
+    assert(hasMiniAlignment(this));
     normal._isMini = 1;
   }
 
@@ -680,8 +682,7 @@ emmalloc_dump_all();
     void* after = region->getAfter();
     // Align for a pointer. We will create a normal region here, not a mini.
     Region* split = (Region*)((char*)region->getAfter() - extra);
-    assert(Region::hasNormalAlignment(split));
-    region->initNormal();
+    split->initNormal();
     region->setTotalSize((char*)split - (char*)region);
     size_t totalSplitSize = (char*)after - (char*)split;
     assert(totalSplitSize >= MIN_NORMAL_REGION_SIZE);

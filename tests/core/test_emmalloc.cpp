@@ -223,6 +223,8 @@ void aligned() {
   }
 }
 
+// TODO: bigger sizes, fewer bins. Need to reach 1 << 18. maybe a test with just 6 values, few bins, etc.
+
 void randoms() {
   stage("randoms");
   emmalloc_blank_slate_from_orbit();
@@ -282,7 +284,9 @@ void randoms() {
     if (bins[i]) free(bins[i]);
   }
   // it's all freed, should be a blank slate
-  assert(check_where_we_would_malloc(10) == start);
+  void* end = check_where_we_would_malloc(10);
+  printf("%d %d\n", start, end);
+  assert(end == start);
 }
 
 int main() {
