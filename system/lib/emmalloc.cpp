@@ -166,11 +166,21 @@ struct FreeInfo {
   FreeInfo* _prev;
   FreeInfo* _next;
 
-  FreeInfo* getPrev() { return _prev; }
-  void setPrev(FreeInfo* x) { _prev = x; }
+  FreeInfo* getPrev() {
+    return _prev;
+  }
+  void setPrev(FreeInfo* x) {
+    assert(this != x);
+    _prev = x;
+  }
 
-  FreeInfo* getNext() { return _next; }
-  void setNext(FreeInfo* x) { _next = x; }
+  FreeInfo* getNext() {
+    return _next;
+  }
+  void setNext(FreeInfo* x) {
+    assert(this != x);
+    _next = x;
+  }
 };
 
 // The first region of memory.
@@ -328,6 +338,7 @@ struct Region {
   // Utilities.
 
   Region* getAfter() {
+    assert(getTotalSize() > 0);
     return (Region*)((char*)this + getTotalSize());
   }
   Region* getNext() {
@@ -525,22 +536,26 @@ static void addToFreeList(Region* region) {
 // Receives a region that has just become free (and is not yet in a freelist).
 // Tries to merge it into a free region before or after it to which it is adjacent.
 // There may be multiple merge opportunities in both directions, due to
-// mini regions preventing previous merges.
-static int mergeIntoExistingFreeRegion(Region* region) {
+// mini regions preventing previous merges. If the region isn't merged into
+// something, we add it to the free lists.
+static void addToFreeLists(Region* region) {
 #ifdef EMMALLOC_DEBUG_LOG
-  EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion " + $0) }, region);
+  EM_ASM({ Module.print("  emmalloc.addToFreeLists " + $0) }, region);
 #endif
-  assert(region->getAfter() <= sbrk(0));
-  int merged = 0;
+  // Start by adding the region to the freelists. We now start with the
+  // state of everything in the lists, and start to merge based on that.
+  // TODO: Optimize.
+  addToFreeList(region);
   Region* prev = region->getPrev();
   Region* next = region->getNext();
   while (prev && !prev->getUsed() &&
          prev->canGrowTo(prev->getTotalSize() + region->getTotalSize(), next)) {
     // Merge them.
 #ifdef EMMALLOC_DEBUG_LOG
-    EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion merge into prev " + $0) }, prev);
+    EM_ASM({ Module.print("  emmalloc.addToFreeLists merge into prev " + $0) }, prev);
 #endif
     removeFromFreeList(prev);
+    removeFromFreeList(region);
     prev->incTotalSize(region->getTotalSize());
     if (next) {
       next->setPrev(prev);
@@ -551,15 +566,14 @@ static int mergeIntoExistingFreeRegion(Region* region) {
     addToFreeList(prev);
     region = prev;
     prev = region->getPrev();
-    merged++;
   }
-  bool addRegionToFreeList = false;
   while (next && !next->getUsed() &&
          region->canGrowTo(region->getTotalSize() + next->getTotalSize(), next->getNext())) {
     // Merge them.
 #ifdef EMMALLOC_DEBUG_LOG
-    EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion merge into next " + $0) }, next);
+    EM_ASM({ Module.print("  emmalloc.addToFreeLists merge into next " + $0) }, next);
 #endif
+    removeFromFreeList(region);
     removeFromFreeList(next);
     region->incTotalSize(next->getTotalSize());
     if (next->getNext()) {
@@ -568,21 +582,14 @@ static int mergeIntoExistingFreeRegion(Region* region) {
       assert(next == lastRegion);
       lastRegion = region;
     }
-    addRegionToFreeList = true;
-    next = region->getNext();
-    merged++;
-  }
-  if (addRegionToFreeList) {
     addToFreeList(region);
+    next = region->getNext();
   }
-  return merged;
 }
 
 static void stopUsing(Region* region) {
   region->setUsed(0);
-  if (!mergeIntoExistingFreeRegion(region)) {
-    addToFreeList(region);
-  }
+  addToFreeLists(region);
 }
 
 // Grow a region. If not in use, we may need to be in another
@@ -670,7 +677,6 @@ static void possiblySplitRemainder(Region* region, size_t size) {
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("    emmalloc.possiblySplitRemainder is splitting") });
 #endif
-emmalloc_dump_all();
     // Worth it, split the region
     // TODO: Consider not doing it, may affect long-term fragmentation.
     void* after = region->getAfter();
@@ -688,7 +694,6 @@ emmalloc_dump_all();
       lastRegion = split;
     }
     stopUsing(split);
-emmalloc_dump_all();
   }
 }
 
@@ -771,6 +776,7 @@ static void emmalloc_validate_all() {
       assert(prev->getAfter() == curr);
     }
     assert(curr->getAfter() <= end);
+    assert(prev != curr);
     prev = curr;
     curr = curr->getNext();
   }
@@ -825,6 +831,7 @@ static void emmalloc_dump_all() {
   EM_ASM({ Module.print("  emmalloc_dump_all:\n    sbrk(0) = " + $0) }, sbrk(0));
   Region* curr = firstRegion;
   EM_ASM({ Module.print("    all regions:") });
+  Region* last;
   while (curr) {
     emmalloc_dump_region(curr);
     curr = curr->getNext();
