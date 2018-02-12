@@ -32,7 +32,7 @@ void stage(const char* name) {
   }, name);
 }
 
-const size_t ALLOCATION_UNIT = 8;
+const size_t ALLOCATION_UNIT = 4;
 
 void basics() {
   stage("basics");
@@ -51,7 +51,7 @@ void basics() {
   assert(size_t(third) == size_t(first) + ((100 + ALLOCATION_UNIT - 1)&(-ALLOCATION_UNIT)) + ALLOCATION_UNIT); // allocation units are multiples of ALLOCATION_UNIT
   stage("allocate 10 more");
   void* four = malloc(10);
-  assert(size_t(four) == size_t(third) + (2*ALLOCATION_UNIT) + ALLOCATION_UNIT); // payload (10 = 2 allocation units) and metadata
+  assert(size_t(four) == size_t(third) + 4*ALLOCATION_UNIT);
   stage("free the first");
   free(second);
   stage("several temp alloc/frees");
@@ -95,7 +95,7 @@ void previous_sbrk() {
   void* other = malloc(10);
   free(other);
   assert(other != old);
-  assert((char*)other == (char*)old + 2 * ALLOCATION_UNIT);
+  assert((char*)other == (char*)old + 3 * ALLOCATION_UNIT);
 }
 
 void min_alloc() {
