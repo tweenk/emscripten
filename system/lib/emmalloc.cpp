@@ -146,7 +146,7 @@ static void* alignUpPointer(void* ptr) {
   return (void*)alignUpPointer(size_t(ptr));
 }
 
-static void getAllocSize(size_t size) {
+static size_t getAllocationSize(size_t size) {
   if (size < MIN_ALLOC) return MIN_ALLOC;
   return (size + ALLOC_UNIT - 1) & -ALLOC_UNIT;
 }
@@ -166,8 +166,11 @@ struct FreeInfo {
   FreeInfo* _prev;
   FreeInfo* _next;
 
-  FreeInfo*& prev() { return _prev; }
-  FreeInfo*& next() { return _next; }
+  FreeInfo* getPrev() { return _prev; }
+  void setPrev(FreeInfo* x) { _prev = x; }
+
+  FreeInfo* getNext() { return _next; }
+  void setNext(FreeInfo* x) { _next = x; }
 };
 
 // The first region of memory.
@@ -209,7 +212,7 @@ struct NormalMetadata {
   Region* _prev;
 };
 
-struct Mini {
+struct MiniMetadata {
   // This will be true.
   size_t _isMini : 1;
 
@@ -253,23 +256,23 @@ struct Region {
     // The mini bit is the same place in both versions, and also identical
     // in the two words of a normal metadata.
     assert(normal._isMini == mini._isMini);
-    assert(normal._isMini == hasMiniAlignment();
+    assert(normal._isMini == hasMiniAlignment(this));
     // It's usually faster to check the alignment than to do a load of the bit.
     // TODO: verify
-    return hasNormalAlignment();
+    return hasNormalAlignment(this);
   }
   int isMini() {
     return !isNormal();
   }
   size_t getUsed() {
     // The used bit is the same place in both versions.
-    assert(normal._isUsed == mini._isUsed);
-    return normal._isUsed;
+    assert(normal._used == mini._used);
+    return normal._used;
   }
   void setUsed(size_t x) {
     // The used bit is the same place in both versions.
-    normal._isUsed = x;
-    assert(normal._isUsed == mini._isUsed);
+    normal._used = x;
+    assert(normal._used == mini._used);
   }
   size_t getTotalSize() {
     if (isNormal()) {
@@ -306,17 +309,17 @@ struct Region {
       return normal._prev;
     } else {
       // Calculate the offset from the actual metadata start.
-      return (void*)(size_t(this) + 4 - (mini._prev << MINI_PREV_SHIFTS));
+      return (Region*)(size_t(this) + 4 - (mini._prev << MINI_PREV_SHIFTS));
     }
   }
   void setPrev(void* x) {
     if (isNormal()) {
-      normal._prev = x;
+      normal._prev = (Region*)x;
     } else {
       // Calculate the offset from the actual metadata start.
       size_t offset = size_t(this) + 4 - size_t(x);
       assert(offset < (1 << (MINI_PREV_BITS + MINI_PREV_SHIFTS)));
-      mini._prev = x >> MINI_PREV_SHIFTS;
+      mini._prev = offset >> MINI_PREV_SHIFTS;
     }
   }
 
@@ -351,13 +354,13 @@ struct Region {
     // Look 4 behind for what is either a mini metadata or
     // the last 4 bytes of a normal one. In both cases,
     // the same bit tells us what it is.
-    Region* region = (char*)payload - 4;
+    Region* region = (Region*)((char*)payload - 4);
     // The bit should be the same in both cases.
     assert(region->normal._isMini == region->mini._isMini);
     if (!region->normal._isMini) {
       // We had the last 4 bytes, look 4 behind to get the
       // actual region.
-      region = (char*)region - 4;
+      region = (Region*)((char*)region - 4);
       assert(region->isNormal());
     } else {
       assert(region->isMini());
@@ -391,7 +394,7 @@ struct Region {
     }
   }
   size_t getPayloadSize() {
-    return getTotalSize() - getMetadatasize();
+    return getTotalSize() - getMetadataSize();
   }
 
   // A mini region has limits on its size, and a region must also
@@ -410,7 +413,7 @@ struct Region {
     return canGrowTo(size, getNext());
   }
   int canGrowPayloadTo(size_t size, Region* possibleNext) {
-    return canGrowTo(getMetadataSize() + size, next);
+    return canGrowTo(getMetadataSize() + size, possibleNext);
   }
   int canGrowPayloadTo(size_t size) {
     return canGrowPayloadTo(size, getNext());
@@ -449,7 +452,7 @@ static FreeInfo* freeLists[MAX_FREELIST_INDEX] = {
 static size_t getFreeListIndex(size_t size) {
   assert(1 << MIN_FREELIST_INDEX == MIN_ALLOC);
   assert(size > 0);
-  size = getAllocSize(size);
+  size = getAllocationSize(size);
   // We need a lower bound here, as the list contains things
   // that can contain at least a power of 2.
   size_t index = lowerBoundPowerOf2(size);
@@ -490,15 +493,15 @@ static void removeFromFreeList(Region* region) {
   EM_ASM({ Module.print("  emmalloc.removeFromFreeList " + $0) },region);
 #endif
   size_t index = getFreeListIndex(region->getPayloadSize());
-  FreeInfo* freeInfo = &region->freeInfo();
+  FreeInfo* freeInfo = region->getFreeInfo();
   if (freeLists[index] == freeInfo) {
-    freeLists[index] = freeInfo->next();
+    freeLists[index] = freeInfo->getNext();
   }
-  if (freeInfo->prev()) {
-    freeInfo->prev()->next() = freeInfo->next();
+  if (freeInfo->getPrev()) {
+    freeInfo->getPrev()->setNext(freeInfo->getNext());
   }
-  if (freeInfo->next()) {
-    freeInfo->next()->prev() = freeInfo->prev();
+  if (freeInfo->getNext()) {
+    freeInfo->getNext()->setPrev(freeInfo->getPrev());
   }
 }
 
@@ -508,13 +511,13 @@ static void addToFreeList(Region* region) {
 #endif
   assert(region->getAfter() <= sbrk(0));
   size_t index = getFreeListIndex(region->getPayloadSize());
-  FreeInfo* freeInfo = &region->freeInfo();
+  FreeInfo* freeInfo = region->getFreeInfo();
   FreeInfo* last = freeLists[index];
   freeLists[index] = freeInfo;
-  freeInfo->prev() = NULL;
-  freeInfo->next() = last;
+  freeInfo->setPrev(NULL);
+  freeInfo->setNext(last);
   if (last) {
-    last->prev() = freeInfo;
+    last->setPrev(freeInfo);
   }
 }
 
@@ -526,8 +529,8 @@ static int mergeIntoExistingFreeRegion(Region* region) {
 #endif
   assert(region->getAfter() <= sbrk(0));
   int merged = 0;
-  Region* prev = region->prev();
-  Region* next = region->next();
+  Region* prev = region->getPrev();
+  Region* next = region->getNext();
   if (prev && !prev->getUsed() &&
       prev->canGrowTo(prev->getTotalSize() + region->getTotalSize(), next)) {
     // Merge them.
@@ -537,7 +540,7 @@ static int mergeIntoExistingFreeRegion(Region* region) {
     removeFromFreeList(prev);
     prev->incTotalSize(region->getTotalSize());
     if (next) {
-      next->prev() = prev; // was: region
+      next->setPrev(prev); // was: region
     } else {
       assert(region == lastRegion);
       lastRegion = prev;
@@ -552,7 +555,7 @@ static int mergeIntoExistingFreeRegion(Region* region) {
         removeFromFreeList(next);
         prev->incTotalSize(next->getTotalSize());
         if (next != lastRegion) {
-          next->next()->prev() = prev;
+          next->getNext()->setPrev(prev);
         } else {
           lastRegion = prev;
         }
@@ -570,7 +573,7 @@ static int mergeIntoExistingFreeRegion(Region* region) {
     removeFromFreeList(next);
     region->incTotalSize(next->getTotalSize());
     if (next != lastRegion) {
-      next->next()->prev() = region;
+      next->getNext()->setPrev(region);
     } else {
       lastRegion = region;
     }
@@ -611,7 +614,7 @@ static int extendLastRegionPayload(size_t size) {
   EM_ASM({ Module.print("  emmalloc.extendLastRegionPayload " + $0) }, size);
 #endif
   size_t reusable = lastRegion->getPayloadSize();
-  size_t sbrkSize = getAllocSize(size) - reusable;
+  size_t sbrkSize = getAllocationSize(size) - reusable;
   void* ptr = sbrk(sbrkSize);
   if (ptr == (void*)-1) {
     // sbrk() failed, we failed.
@@ -621,14 +624,14 @@ static int extendLastRegionPayload(size_t size) {
     return 0;
   }
   // sbrk() should give us new space right after the last region.
-  assert(ptr == getAfter(lastRegion));
+  assert(ptr == lastRegion->getAfter());
   // Increment the region's size.
   growRegion(lastRegion, sbrkSize);
   return 1;
 }
 
 static int incLastRegion(size_t extra) {
-  return extendLastRegionPayload(getMaxPayload(lastRegion) + extra);
+  return extendLastRegionPayload(lastRegion->getPayloadSize() + extra);
 }
 
 static void possiblySplitRemainder(Region* region, size_t size) {
@@ -671,9 +674,9 @@ static void possiblySplitRemainder(Region* region, size_t size) {
     size_t totalSplitSize = (char*)after - (char*)split;
     assert(totalSplitSize >= MIN_NORMAL_REGION_SIZE);
     split->setTotalSize(totalSplitSize);
-    split->prev() = region;
+    split->setPrev(region);
     if (region != lastRegion) {
-      split->next()->prev() = split;
+      split->getNext()->setPrev(split);
     } else {
       lastRegion = split;
     }
@@ -696,7 +699,7 @@ static void useRegion(Region* region, size_t size) {
 }
 
 static Region* useFreeInfo(FreeInfo* freeInfo, size_t size) {
-  Region* region = Region::Region::fromFreeInfo(freeInfo);
+  Region* region = Region::getFromFreeInfo(freeInfo);
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.useFreeInfo " + [$0, $1]) }, region, size);
 #endif
@@ -724,13 +727,13 @@ void emmalloc_blank_slate_from_orbit() {
 static void emmalloc_validate_region(Region* region) {
   assert(region->getAfter() <= sbrk(0));
   assert(region->getPayloadSize() < region->getTotalSize());
-  if (region->prev()) {
-    assert(getAfter(region->prev()) == region);
-    assert(region->prev()->next() == region);
+  if (region->getPrev()) {
+    assert(getAfter(region->getPrev()) == region);
+    assert(region->getPrev()->getNext() == region);
   }
-  if (region->next()) {
-    assert(region->getAfter() == region->next());
-    assert(region->next()->prev() == region);
+  if (region->getNext()) {
+    assert(region->getAfter() == region->getNext());
+    assert(region->getNext()->getPrev() == region);
   }
 }
 
@@ -752,13 +755,13 @@ static void emmalloc_validate_all() {
       assert(!Module.emmallocDebug.regions[region], "dupe region");
       Module.emmallocDebug.regions[region] = 1;
     }, curr);
-    assert(curr->prev() == prev);
+    assert(curr->getPrev() == prev);
     if (prev) {
       assert(getAfter(prev) == curr);
     }
     assert(getAfter(curr) <= end);
     prev = curr;
-    curr = curr->next();
+    curr = curr->getNext();
   }
   if (prev) {
     assert(prev == lastRegion);
@@ -766,7 +769,7 @@ static void emmalloc_validate_all() {
     assert(!lastRegion);
   }
   if (lastRegion) {
-    assert(getAfter(lastRegion) == end);
+    assert(lastRegion->getAfter() == end);
   }
   // Validate freelists.
   for (int i = 0; i < MAX_FREELIST_INDEX; i++) {
@@ -774,7 +777,7 @@ static void emmalloc_validate_all() {
     if (!curr) continue;
     FreeInfo* prev = NULL;
     while (curr) {
-      assert(curr->prev() == prev);
+      assert(curr->getPrev() == prev);
       Region* region = fromFreeInfo(curr);
       // Regions must be in the main list.
       EM_ASM({
@@ -786,13 +789,13 @@ static void emmalloc_validate_all() {
       assert(region->getPayloadSize() >= getMinSizeForFreeListIndex(i));
       assert(region->getPayloadSize() <  getMaxSizeForFreeListIndex(i));
       prev = curr;
-      curr = curr->next();
+      curr = curr->getNext();
     }
   }
   // Validate lastRegion.
   if (lastRegion) {
-    assert(lastRegion->next() == NULL);
-    assert(getAfter(lastRegion) <= end);
+    assert(lastRegion->getNext() == NULL);
+    assert(lastRegion->getAfter() <= end);
     assert(firstRegion);
   } else {
     assert(!firstRegion);
@@ -813,7 +816,7 @@ static void emmalloc_dump_all() {
   EM_ASM({ Module.print("    all regions:") });
   while (curr) {
     emmalloc_dump_region(curr);
-    curr = curr->next();
+    curr = curr->getNext();
   }
   for (int i = 0; i < MAX_FREELIST_INDEX; i++) {
     FreeInfo* curr = freeLists[i];
@@ -824,7 +827,7 @@ static void emmalloc_dump_all() {
       Region* region = fromFreeInfo(curr);
       emmalloc_dump_region(region);
       prev = curr;
-      curr = curr->next();
+      curr = curr->getNext();
     }
   }
 }
@@ -872,7 +875,7 @@ static Region* tryFromFreeList(size_t size) {
     FreeInfo* freeInfo = freeLists[index - 1];
     size_t tries = 0;
     while (freeInfo && tries < SPECULATIVE_FREELIST_TRIES) {
-      Region* region = Region::fromFreeInfo(freeInfo);
+      Region* region = Region::getFromFreeInfo(freeInfo);
       if (region->getPayloadSize() >= size) {
         // Success, use it
 #ifdef EMMALLOC_DEBUG_LOG
@@ -880,7 +883,7 @@ static Region* tryFromFreeList(size_t size) {
 #endif
         return useFreeInfo(freeInfo, size);
       }
-      freeInfo = freeInfo->next();
+      freeInfo = freeInfo->getNext();
       tries++;
     }
   }
@@ -932,7 +935,7 @@ static Region* allocateRegion(size_t size) {
     }
   } else if ((lastRegion->getTotalSize() > MAX_MINI_SIZE ||
               size + MINI_METADATA_SIZE > MAX_MINI_SIZE) &&
-             Region::hasMiniAlignment(lastRegion->getAfter()) {
+             Region::hasMiniAlignment(lastRegion->getAfter())) {
     // We need a normal region, but the alignment is for a mini.
     // The simplest thing is to increase the previous region by
     // enough to get us the proper alignment for a normal
@@ -948,7 +951,7 @@ static Region* allocateRegion(size_t size) {
          Region::hasNormalAlignment(lastRegion->getAfter()));
   int useMini = Region::hasMiniAlignment(lastRegion->getAfter());
   size_t sbrkSize = useMini ? MINI_METADATA_SIZE : NORMAL_METADATA_SIZE;
-  sbrkSize += getAllocSize(size);
+  sbrkSize += getAllocationSize(size);
   void* ptr = sbrk(sbrkSize);
   if (ptr == (void*)-1) return NULL;
   Region* region = (Region*)ptr;
@@ -964,7 +967,7 @@ static Region* allocateRegion(size_t size) {
     lastRegion = region;
   } else {
     assert(firstRegion);
-    region->prev() = lastRegion;
+    region->setPrev(lastRegion);
     lastRegion = region;
   }
   // Success, we have new memory
@@ -1025,7 +1028,7 @@ static void* emmalloc_malloc(size_t size) {
 
 static void emmalloc_free(void *ptr) {
   if (ptr == NULL) return;
-  stopUsing(Region::fromPayload(ptr));
+  stopUsing(Region::getFromPayload(ptr));
 }
 
 static void* emmalloc_calloc(size_t nmemb, size_t size) {
@@ -1043,7 +1046,7 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     emmalloc_free(ptr);
     return NULL;
   }
-  Region* region = Region::fromPayload(ptr);
+  Region* region = Region::getFromPayload(ptr);
   // Grow it. First, maybe we can do simple growth in the current region.
   if (size <= region->getPayloadSize()) {
 #ifdef EMMALLOC_DEBUG_LOG
@@ -1055,7 +1058,7 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     return ptr;
   }
   // Perhaps right after us is free space we can merge to us.
-  Region* next = region->next();
+  Region* next = region->getNext();
   if (next && !next->getUsed() &&
       region->canGrowTo(region->getTotalSize() + next->getTotalSize(),
                         next->getNext())) {
@@ -1065,7 +1068,7 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     removeFromFreeList(next);
     region->incTotalSize(next->getTotalSize());
     if (next != lastRegion) {
-      next->next()->prev() = region;
+      next->getNext()->setPrev(region);
     } else {
       lastRegion = region;
     }
@@ -1106,9 +1109,9 @@ static void* emmalloc_realloc(void *ptr, size_t size) {
     newRegion = newAllocation(size);
     if (!newRegion) return NULL;
   }
-  memcpy(getPayload(newRegion), region->getPayload(), size < region->getPayloadSize() ? size : region->getPayloadSize());
+  memcpy(newRegion->getPayload(), region->getPayload(), size < region->getPayloadSize() ? size : region->getPayloadSize());
   stopUsing(region);
-  return getPayload(newRegion);
+  return newRegion->getPayload();
 }
 
 static struct mallinfo emmalloc_mallinfo() {
@@ -1133,15 +1136,16 @@ static struct mallinfo emmalloc_mallinfo() {
         info.fordblks += region->getPayloadSize();
         info.ordblks++;
       }
-      region = region->next();
+      region = region->getNext();
     }
   }
   return info;
 }
-waka
+
 // An aligned allocation. This is a rarer allocation path, and is
 // much less optimized - the assumption is that it is used for few
-// large allocations.
+// large allocations. One specific simplication we make is that we
+// only do such new allocations in normal regions, not mini ones.
 static void* alignedAllocation(size_t size, size_t alignment) {
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.alignedAllocation") });
@@ -1153,7 +1157,7 @@ static void* alignedAllocation(size_t size, size_t alignment) {
   // TODO: Perhaps look more carefully, checking alignment as we go,
   //       using multiple tries?
   Region* fromFreeList = tryFromFreeList(size + alignment);
-  if (fromFreeList && size_t(getPayload(fromFreeList)) % alignment == 0) {
+  if (fromFreeList && size_t(fromFreeList->getPayload()) % alignment == 0) {
     // Luck has favored us.
     return fromFreeList->getPayload();
   } else if (fromFreeList) {
@@ -1167,13 +1171,13 @@ static void* alignedAllocation(size_t size, size_t alignment) {
   // Ensure a region before us, which we may enlarge as necessary.
   if (!lastRegion) {
     // This allocation is not freeable, but there is one at most.
-    void* prev = emmalloc_malloc(MIN_REGION_SIZE);
+    void* prev = emmalloc_malloc(MIN_NORMAL_REGION_SIZE);
     if (!prev) return NULL;
   }
   // See if we need to enlarge the previous region in order to get
   // us properly aligned. Take into account that our region will
   // start with METADATA_SIZE of space.
-  size_t address = size_t(getAfter(lastRegion)) + METADATA_SIZE;
+  size_t address = size_t(lastRegion->getAfter()) + NORMAL_METADATA_SIZE;
   size_t error = address % alignment;
   if (error != 0) {
     // E.g. if we want alignment 24, and have address 16, then we
@@ -1183,7 +1187,7 @@ static void* alignedAllocation(size_t size, size_t alignment) {
     if (!incLastRegion(extra)) {
       return NULL;
     }
-    address = size_t(getAfter(lastRegion)) + METADATA_SIZE;
+    address = size_t(lastRegion->getAfter()) + NORMAL_METADATA_SIZE;
     error = address % alignment;
     assert(error == 0);
   }
