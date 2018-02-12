@@ -524,6 +524,8 @@ static void addToFreeList(Region* region) {
 
 // Receives a region that has just become free (and is not yet in a freelist).
 // Tries to merge it into a free region before or after it to which it is adjacent.
+// There may be multiple merge opportunities in both directions, due to
+// mini regions preventing previous merges.
 static int mergeIntoExistingFreeRegion(Region* region) {
 #ifdef EMMALLOC_DEBUG_LOG
   EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion " + $0) }, region);
@@ -532,8 +534,8 @@ static int mergeIntoExistingFreeRegion(Region* region) {
   int merged = 0;
   Region* prev = region->getPrev();
   Region* next = region->getNext();
-  if (prev && !prev->getUsed() &&
-      prev->canGrowTo(prev->getTotalSize() + region->getTotalSize(), next)) {
+  while (prev && !prev->getUsed() &&
+         prev->canGrowTo(prev->getTotalSize() + region->getTotalSize(), next)) {
     // Merge them.
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion merge into prev " + $0) }, prev);
@@ -541,47 +543,39 @@ static int mergeIntoExistingFreeRegion(Region* region) {
     removeFromFreeList(prev);
     prev->incTotalSize(region->getTotalSize());
     if (next) {
-      next->setPrev(prev); // was: region
+      next->setPrev(prev);
     } else {
       assert(region == lastRegion);
       lastRegion = prev;
     }
-    if (next) {
-      // We may also be able to merge with the next, keep trying.
-      if (!next->getUsed() &&
-          prev->canGrowTo(prev->getTotalSize() + next->getTotalSize(), next->getNext())) {
-#ifdef EMMALLOC_DEBUG_LOG
-        EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion also merge into next " + $0) }, next);
-#endif
-        removeFromFreeList(next);
-        prev->incTotalSize(next->getTotalSize());
-        if (next != lastRegion) {
-          next->getNext()->setPrev(prev);
-        } else {
-          lastRegion = prev;
-        }
-      }
-    }
     addToFreeList(prev);
-    return 1;
+    region = prev;
+    prev = region->getPrev();
+    merged++;
   }
-  if (next && !next->getUsed() &&
-      region->canGrowTo(region->getTotalSize() + next->getTotalSize(), next->getNext())) {
+  bool addRegionToFreeList = false;
+  while (next && !next->getUsed() &&
+         region->canGrowTo(region->getTotalSize() + next->getTotalSize(), next->getNext())) {
+    // Merge them.
 #ifdef EMMALLOC_DEBUG_LOG
     EM_ASM({ Module.print("  emmalloc.mergeIntoExistingFreeRegion merge into next " + $0) }, next);
 #endif
-    // Merge them.
     removeFromFreeList(next);
     region->incTotalSize(next->getTotalSize());
-    if (next != lastRegion) {
+    if (next->getNext()) {
       next->getNext()->setPrev(region);
     } else {
+      assert(next == lastRegion);
       lastRegion = region;
     }
-    addToFreeList(region);
-    return 1;
+    addRegionToFreeList = true;
+    next = region->getNext();
+    merged++;
   }
-  return 0;
+  if (addRegionToFreeList) {
+    addToFreeList(region);
+  }
+  return merged;
 }
 
 static void stopUsing(Region* region) {
