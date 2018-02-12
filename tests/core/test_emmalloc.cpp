@@ -100,11 +100,23 @@ void previous_sbrk() {
 
 void min_alloc() {
   stage("min_alloc");
-  emmalloc_blank_slate_from_orbit();
   void* start = check_where_we_would_malloc(1);
   for (int i = 1; i < 100; i++) {
+    emmalloc_blank_slate_from_orbit();
     void* temp = malloc(i);
-    void* expected = (char*)start + ALLOCATION_UNIT + ALLOCATION_UNIT * ((i + ALLOCATION_UNIT - 1) / ALLOCATION_UNIT);
+    char* expected = (char*)temp;
+    if (i < 8) {
+      expected += 8;
+    } else {
+      expected += (i + 3) & -4;
+    }
+    // metadata may be 4 or 8
+    if (size_t(expected) % 8 == 4) {
+      expected += 4;
+    } else {
+      expected += 8;
+    }
+    printf("%d %d %d\n", i, start, expected);
     check_where_we_would_malloc(1, expected);
     free(temp);
   }

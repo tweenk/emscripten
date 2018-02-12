@@ -344,7 +344,6 @@ struct Region {
     }
   }
   FreeInfo* getFreeInfo() {
-    assert(!getUsed());
     return (FreeInfo*)getPayload();
   }
 
