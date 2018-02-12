@@ -728,7 +728,7 @@ static void emmalloc_validate_region(Region* region) {
   assert(region->getAfter() <= sbrk(0));
   assert(region->getPayloadSize() < region->getTotalSize());
   if (region->getPrev()) {
-    assert(getAfter(region->getPrev()) == region);
+    assert(region->getPrev()->getAfter() == region);
     assert(region->getPrev()->getNext() == region);
   }
   if (region->getNext()) {
@@ -757,9 +757,9 @@ static void emmalloc_validate_all() {
     }, curr);
     assert(curr->getPrev() == prev);
     if (prev) {
-      assert(getAfter(prev) == curr);
+      assert(prev->getAfter() == curr);
     }
-    assert(getAfter(curr) <= end);
+    assert(curr->getAfter() <= end);
     prev = curr;
     curr = curr->getNext();
   }
@@ -778,7 +778,7 @@ static void emmalloc_validate_all() {
     FreeInfo* prev = NULL;
     while (curr) {
       assert(curr->getPrev() == prev);
-      Region* region = fromFreeInfo(curr);
+      Region* region = Region::getFromFreeInfo(curr);
       // Regions must be in the main list.
       EM_ASM({
         var region = $0;
@@ -824,7 +824,7 @@ static void emmalloc_dump_all() {
     EM_ASM({ Module.print("    freeList[" + $0 + "] sizes: [" + $1 + ", " + $2 + ")") }, i, getMinSizeForFreeListIndex(i), getMaxSizeForFreeListIndex(i));
     FreeInfo* prev = NULL;
     while (curr) {
-      Region* region = fromFreeInfo(curr);
+      Region* region = Region::getFromFreeInfo(curr);
       emmalloc_dump_region(region);
       prev = curr;
       curr = curr->getNext();
@@ -926,6 +926,9 @@ static Region* allocateRegion(size_t size) {
     if (ptr == (void*)-1) return NULL;
     void* fixedPtr = alignUpPointer(ptr);
     if (ptr != fixedPtr) {
+#ifdef EMMALLOC_DEBUG_LOG
+      EM_ASM({ Module.print("  emmalloc.allocateRegion fixing sbrk() alignment") });
+#endif
       size_t extra = (char*)fixedPtr - (char*)ptr;
       void* extraPtr = sbrk(extra);
       if (extraPtr == (void*)-1) {
@@ -941,16 +944,22 @@ static Region* allocateRegion(size_t size) {
     // enough to get us the proper alignment for a normal
     // region. (Both conditions are rare since this only happens
     // on very large regions, so this is likely not much waste.)
+#ifdef EMMALLOC_DEBUG_LOG
+    EM_ASM({ Module.print("  emmalloc.allocateRegion convert to normal region alignment") });
+#endif
     if (!incLastRegion(MINI_REGION_ALIGN)) {
       return NULL;
     }
   }
   // We should now have the proper alignment for everything, and are
   // ready to create the new region.
-  assert(Region::hasMiniAlignment(lastRegion->getAfter()) ||
-         Region::hasNormalAlignment(lastRegion->getAfter()));
-  int useMini = Region::hasMiniAlignment(lastRegion->getAfter());
+  assert(Region::hasMiniAlignment(sbrk(0)) ||
+         Region::hasNormalAlignment(sbrk(0)));
+  int useMini = lastRegion && Region::hasMiniAlignment(lastRegion->getAfter());
   size_t sbrkSize = useMini ? MINI_METADATA_SIZE : NORMAL_METADATA_SIZE;
+#ifdef EMMALLOC_DEBUG_LOG
+  EM_ASM({ Module.print("  emmalloc.allocateRegion allocating " + [$0, $1]) }, useMini, sbrkSize);
+#endif
   sbrkSize += getAllocationSize(size);
   void* ptr = sbrk(sbrkSize);
   if (ptr == (void*)-1) return NULL;
