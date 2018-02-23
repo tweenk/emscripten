@@ -7610,19 +7610,19 @@ var LibraryGL = {
   },
 
   // signatures of simple pass-through functions, see later
-
   glActiveTexture__sig: 'vi',
   glCheckFramebufferStatus__sig: 'ii',
   glRenderbufferStorage__sig: 'viiii',
   glClearStencil__sig: 'vi',
   glStencilFunc__sig: 'viii',
+  glStencilFuncSeparate__sig: 'viiii',
   glLineWidth__sig: 'vi',
   glBlendEquation__sig: 'vi',
   glBlendEquationSeparate__sig: 'vii',
-  glVertexAttrib1f__sig: 'vii',
-  glVertexAttrib2f__sig: 'viii',
-  glVertexAttrib3f__sig: 'viiii',
-  glVertexAttrib4f__sig: 'viiiii',
+  glVertexAttrib1f__sig: 'vif',
+  glVertexAttrib2f__sig: 'viff',
+  glVertexAttrib3f__sig: 'vifff',
+  glVertexAttrib4f__sig: 'viffff',
   glCullFace__sig: 'vi',
   glBlendFunc__sig: 'vii',
   glBlendFuncSeparate__sig: 'viiii',
@@ -7636,12 +7636,20 @@ var LibraryGL = {
   glDepthFunc__sig: 'vi',
   glStencilMask__sig: 'vi',
   glStencilMaskSeparate__sig: 'vii',
-  glClearDepthf__sig: 'vi',
+  glClearDepth__sig: 'vi',
+  glClearDepthf__sig: 'vf',
   glFinish__sig: 'v',
   glFlush__sig: 'v',
   glClearColor__sig: 'viiii',
   glIsEnabled__sig: 'ii',
   glFrontFace__sig: 'vi',
+  glClear__sig: 'vi',
+  glCopyTexImage2D__sig: 'viiiiiiii',
+  glCopyTexSubImage2D__sig: 'viiiiiiii',
+  glDisable__sig: 'vi',
+  glEnable__sig: 'vi',
+  glScissor__sig: 'viiii',
+
 #if USE_WEBGL2
   glVertexAttribI4i__sig: 'viiiii',
   glVertexAttribI4ui__sig: 'viiiii',
@@ -7712,7 +7720,7 @@ glFuncs.forEach(function(data) {
     var cName = 'gl' + cName[0].toUpperCase() + cName.substr(1);
     assert(!(cName in LibraryGL), "Cannot reimplement the existing function " + cName);
     LibraryGL[cName] = eval(stub.replace('NAME', name));
-    if (!LibraryGL[cName + '__sig']) LibraryGL[cName + '__sig'] = sig;
+    assert(LibraryGL[cName + "__sig"].length == sig.length, "Signature mismatch for function " + cName);
   });
 });
 
